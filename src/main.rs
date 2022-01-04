@@ -1,11 +1,19 @@
+mod htsc;
+
+use std::sync::atomic::AtomicI32;
+
+use aopt::prelude::*;
+
+use async_std::task::spawn;
 use async_std::{
-    channel::{bounded, Receiver, Sender},
-    fs::File,
-    io::{prelude::BufReadExt, BufReader},
+    channel::{bounded, Receiver},
     sync::Arc,
 };
-use encoding_rs::GBK;
+
 use xlsxwriter::{Workbook, XlsxError};
+
+const HTSC_TYPE: &'static str = "HTSC";
+const OUTPUT: &'static str = "output.xlsx";
 
 #[async_std::main]
 async fn main() -> color_eyre::Result<()> {
@@ -14,71 +22,64 @@ async fn main() -> color_eyre::Result<()> {
         .init();
     color_eyre::install()?;
 
-    let output_name = "output.xlsx";
-    let (s, r) = bounded(64);
+    let (s, r) = bounded(128);
     let sender = Arc::new(s);
     let receiver = Arc::new(r);
-    let mut sender_waiter = vec![];
-    let mut counter = 0;
+    let mut set = SimpleSet::default()
+        .with_default_creator()
+        .with_default_prefix();
+    let mut parser = SimpleParser::<UidGenerator>::default();
 
-    for arg in std::env::args().skip(1) {
-        sender_waiter.push(async_std::task::spawn(read_from_htsc_export_txt(
-            arg.clone(),
-            sender.clone(),
-        )));
-        counter += 1;
+    set.add_opt("-t=s!")?
+        .add_alias("--type")?
+        .set_default_value(HTSC_TYPE.into())
+        .commit()?;
+    set.add_opt("-o=s")?
+        .add_alias("--output")?
+        .set_default_value(OUTPUT.into())
+        .commit()?;
+
+    let uid = set.add_opt("input=p@*")?.commit()?;
+    let counter = Arc::new(AtomicI32::new(0));
+    let counter_reader = counter.clone();
+
+    parser.add_callback(
+        uid,
+        simple_pos_cb!(move |_, set, path, _, value| {
+            let default_value = String::default();
+            let file_type = if let Some(value) = set.get_value("--type")? {
+                value.as_str().unwrap_or(&default_value).as_str()
+            } else {
+                HTSC_TYPE
+            };
+
+            match file_type {
+                HTSC_TYPE => {
+                    spawn(htsc::read_from_export_file(String::from(path), sender.clone()));
+                }
+                _ => {
+                    panic!("Unknow file type: {}", file_type);
+                }
+            }
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(value))
+        }),
+    );
+
+    getopt!(&mut std::env::args().skip(1), set, parser)?;
+
+    let output_name = set.get_value("--output")?.unwrap().as_str().unwrap();
+
+    if counter_reader.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        write_htsc_to_tzzb_excel(output_name.to_owned(), receiver.clone(), counter_reader).await?;
     }
-
-    write_htsc_to_tzzb_excel(output_name.to_owned(), receiver.clone(), counter).await?;
-    Ok(())
-}
-
-async fn read_from_htsc_export_txt(
-    path: String,
-    sender: Arc<Sender<Option<DeliveryOrder>>>,
-) -> std::io::Result<()> {
-    let mut reader = BufReader::new(File::open(&path).await?);
-    let mut buffer = Vec::with_capacity(4096);
-    let gbk_encoder = GBK;
-
-    if reader.read_until(0x0a as u8, &mut buffer).await? > 0 {
-        let (line, _, _) = gbk_encoder.decode(&buffer);
-        let title: Vec<String> = line.trim().split("\t").map(|v| String::from(v)).collect();
-        // checking the line name
-        for i in 0..HTSC_CHECK_TITLE.len() {
-            assert_eq!(HTSC_CHECK_TITLE[i], title[i]);
-        }
-    }
-
-    loop {
-        buffer.clear();
-
-        let size = reader.read_until(0x0a as u8, &mut buffer).await?;
-
-        if size > 0 {
-            let (line, _, _) = gbk_encoder.decode(&buffer);
-            let order = DeliveryOrder::from_htsc_line(line.to_string());
-
-            sender
-                .send(Some(order))
-                .await
-                .expect(&format!("Can't send data from read thread: {}!", &path));
-        } else {
-            sender
-                .send(None)
-                .await
-                .expect(&format!("Can't send data to write thread"));
-            break;
-        }
-    }
-
     Ok(())
 }
 
 async fn write_htsc_to_tzzb_excel(
     path: String,
     rec: Arc<Receiver<Option<DeliveryOrder>>>,
-    read_thread_counter: i32,
+    counter_reader: Arc<AtomicI32>,
 ) -> Result<(), XlsxError> {
     static TZZB_TITLE: [&'static str; 8] = [
         "成交日期",
@@ -117,11 +118,13 @@ async fn write_htsc_to_tzzb_excel(
             sheet.write_string(counter, 7, order.get_owned(), None)?;
         } else {
             read_stop_counter += 1;
-            if read_stop_counter == read_thread_counter {
+            if read_stop_counter == counter_reader.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
         }
     }
+
+    println!("--> read count = {}, {:?}", counter, counter_reader);
 
     workbook.close()?;
 
@@ -140,55 +143,7 @@ pub struct DeliveryOrder {
     owned: String,
 }
 
-const HTSC_DATE: usize = 0;
-const HTSC_CODE: usize = 2;
-const HTSC_NAME: usize = 3;
-const HTSC_KIND: usize = 4;
-const HTSC_COUNT: usize = 5;
-const HTSC_PRIZE: usize = 6;
-const HTSC_ACTUAL: usize = 11;
-const HTSC_OWNED: usize = 18;
-
-static HTSC_CHECK_TITLE: [&'static str; 20] = [
-    "发生日期",
-    "备注",
-    "证券代码",
-    "证券名称",
-    "买卖标志",
-    "成交数量",
-    "成交价格",
-    "成交金额",
-    "佣金",
-    "印花税",
-    "过户费",
-    "发生金额",
-    "剩余金额",
-    "申报序号",
-    "股东代码",
-    "席位代码",
-    "委托编号",
-    "成交编号",
-    "证券数量",
-    "其他费",
-];
-
 impl DeliveryOrder {
-    pub fn from_htsc_line(line: String) -> Self {
-        let columns: Vec<&str> = line.trim().split("\t").collect();
-
-        assert_eq!(columns.len(), 20);
-
-        Self::default()
-            .with_date(columns[HTSC_DATE].to_owned())
-            .with_code(columns[HTSC_CODE].to_owned())
-            .with_name(columns[HTSC_NAME].to_owned())
-            .with_kind(columns[HTSC_KIND].to_owned())
-            .with_count(columns[HTSC_COUNT].to_owned())
-            .with_prize(columns[HTSC_PRIZE].to_owned())
-            .with_actual(columns[HTSC_ACTUAL].to_owned())
-            .with_owned(columns[HTSC_OWNED].to_owned())
-    }
-
     pub fn set_code(&mut self, code: String) {
         self.code = code;
     }
