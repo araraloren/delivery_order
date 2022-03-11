@@ -1,10 +1,11 @@
 mod htsc;
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicI32;
 
 use aopt::prelude::*;
 
-use async_std::task::spawn;
+use async_std::sync::Mutex;
 use async_std::{
     channel::{bounded, Receiver},
     sync::Arc,
@@ -25,52 +26,91 @@ async fn main() -> color_eyre::Result<()> {
     let (s, r) = bounded(128);
     let sender = Arc::new(s);
     let receiver = Arc::new(r);
-    let mut set = SimpleSet::default()
-        .with_default_creator()
-        .with_default_prefix();
-    let mut parser = SimpleParser::<UidGenerator>::default();
+    let htsc_context = Arc::new(Mutex::new(htsc::Context::new()));
+    let mut parser = ForwardParser::default();
 
-    set.add_opt("-t=s!")?
+    parser
+        .add_opt("-t=s!")?
         .add_alias("--type")?
         .set_default_value(HTSC_TYPE.into())
         .commit()?;
-    set.add_opt("-o=s")?
+    parser
+        .add_opt("-o=s")?
         .add_alias("--output")?
         .set_default_value(OUTPUT.into())
         .commit()?;
+    parser.add_opt("-d=b")?.add_alias("--debug")?.commit()?;
 
-    let uid = set.add_opt("input=p@*")?.commit()?;
+    let uid = parser.add_opt("input=p!@*")?.commit()?;
     let counter = Arc::new(AtomicI32::new(0));
     let counter_reader = counter.clone();
 
+    type Input = HashMap<String, Vec<String>>;
+
     parser.add_callback(
         uid,
-        simple_pos_cb!(move |_, set, path, _, value| {
-            let default_value = String::default();
-            let file_type = if let Some(value) = set.get_value("--type")? {
-                value.as_str().unwrap_or(&default_value).as_str()
-            } else {
-                HTSC_TYPE
-            };
+        simple_pos_mut_cb!(move |uid, set: &mut SimpleSet, path, _, _| {
+            let file_type = set["--type"].get_value().as_str().unwrap().clone();
+            let opt = set[uid].as_mut();
+            let mut inputs: Input;
 
-            match file_type {
+            if let Some(inner_data) = opt.get_value_mut().downcast_mut::<Input>() {
+                inputs = std::mem::take(inner_data);
+            } else {
+                inputs = Input::default();
+            }
+            match file_type.as_str() {
                 HTSC_TYPE => {
-                    spawn(htsc::read_from_export_file(String::from(path), sender.clone()));
+                    inputs
+                        .entry(String::from(file_type))
+                        .or_insert(vec![])
+                        .push(path.to_owned());
                 }
                 _ => {
                     panic!("Unknow file type: {}", file_type);
                 }
             }
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Some(value))
+            Ok(Some(OptValue::from_any(Box::new(inputs))))
         }),
     );
 
-    getopt!(&mut std::env::args().skip(1), set, parser)?;
+    getopt!(&mut std::env::args().skip(1), parser)?;
 
-    let output_name = set.get_value("--output")?.unwrap().as_str().unwrap();
+    let inputs;
+    let debug = *parser["--debug"].get_value().as_bool().unwrap_or(&false);
+
+    if let Some(inner_data) = parser["input"].get_value_mut().downcast_mut::<Input>() {
+        inputs = std::mem::take(inner_data);
+    } else {
+        inputs = Input::default();
+    }
+    if debug {
+        println!("got file map: {:?}", inputs);
+        println!("got output file count = {:?}", counter_reader);
+    }
+    if counter_reader.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        for (type_, paths) in inputs.iter() {
+            match type_.as_str() {
+                HTSC_TYPE => {
+                    async_std::task::spawn(htsc::extract_from_file(
+                        htsc_context.clone(),
+                        paths.clone(),
+                        sender.clone(),
+                        debug,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let output_name = parser.get_value("--output")?.unwrap().as_str().unwrap();
 
     if counter_reader.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        if debug {
+            println!("got output file name = {:?}", output_name);
+        }
         write_htsc_to_tzzb_excel(output_name.to_owned(), receiver.clone(), counter_reader).await?;
     }
     Ok(())
@@ -81,24 +121,14 @@ async fn write_htsc_to_tzzb_excel(
     rec: Arc<Receiver<Option<DeliveryOrder>>>,
     counter_reader: Arc<AtomicI32>,
 ) -> Result<(), XlsxError> {
-    static TZZB_TITLE: [&'static str; 8] = [
-        "成交日期",
-        "证券代码",
-        "证券名称",
-        "交易类别",
-        "成交数量",
-        "成交价格",
-        "发生金额",
-        "证券余额",
-    ];
-
+    let title = htsc::Context::gen_title();
     let workbook = Workbook::new(&path);
     let mut sheet = workbook.add_worksheet(None)?;
     let mut counter = 0;
     let mut read_stop_counter = 0;
 
-    for idx in 0..TZZB_TITLE.len() {
-        sheet.write_string(counter, idx as u16, TZZB_TITLE[idx], None)?;
+    for idx in 0..title.len() {
+        sheet.write_string(counter, idx as u16, &title[idx], None)?;
     }
 
     loop {
@@ -114,7 +144,7 @@ async fn write_htsc_to_tzzb_excel(
             sheet.write_string(counter, 3, order.get_kind(), None)?;
             sheet.write_string(counter, 4, order.get_count(), None)?;
             sheet.write_string(counter, 5, order.get_prize(), None)?;
-            sheet.write_string(counter, 6, order.get_actual(), None)?;
+            sheet.write_string(counter, 6, order.get_amount(), None)?;
             sheet.write_string(counter, 7, order.get_owned(), None)?;
         } else {
             read_stop_counter += 1;
@@ -131,6 +161,21 @@ async fn write_htsc_to_tzzb_excel(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub enum Trade {
+    Buy,
+    Sell,
+    In,
+    Out,
+    Ignore,
+}
+
+impl Default for Trade {
+    fn default() -> Self {
+        Trade::Ignore
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DeliveryOrder {
     code: String,
@@ -139,8 +184,9 @@ pub struct DeliveryOrder {
     kind: String,
     count: String,
     prize: String,
-    actual: String,
+    amount: String,
     owned: String,
+    trade: Trade,
 }
 
 impl DeliveryOrder {
@@ -168,8 +214,8 @@ impl DeliveryOrder {
         self.prize = prize;
     }
 
-    pub fn set_actual(&mut self, actual: String) {
-        self.actual = actual;
+    pub fn set_amount(&mut self, amount: String) {
+        self.amount = amount;
     }
 
     pub fn set_owned(&mut self, owned: String) {
@@ -206,13 +252,18 @@ impl DeliveryOrder {
         self
     }
 
-    pub fn with_actual(mut self, actual: String) -> Self {
-        self.actual = actual;
+    pub fn with_amount(mut self, amount: String) -> Self {
+        self.amount = amount;
         self
     }
 
     pub fn with_owned(mut self, owned: String) -> Self {
         self.owned = owned;
+        self
+    }
+
+    pub fn with_trade(mut self, trade: Trade) -> Self {
+        self.trade = trade;
         self
     }
 
@@ -240,11 +291,22 @@ impl DeliveryOrder {
         &self.prize
     }
 
-    pub fn get_actual(&self) -> &String {
-        &self.actual
+    pub fn get_amount(&self) -> &String {
+        &self.amount
     }
 
     pub fn get_owned(&self) -> &String {
         &self.owned
+    }
+
+    pub fn get_trade(&self) -> &Trade {
+        &self.trade
+    }
+
+    pub fn is_valid(&self) -> bool {
+        match self.trade {
+            Trade::Ignore => false,
+            _ => true,
+        }
     }
 }
